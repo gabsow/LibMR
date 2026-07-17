@@ -549,6 +549,22 @@ static int checkTLS(char** client_key, char** client_cert, char** ca_cert, char*
 
     clusterTls = getConfigValue(mr_staticCtx, "tls-cluster");
     if (!clusterTls || strcmp(clusterTls, "yes")) {
+        /* MOD-16951: in OSS cluster the peer address we dial comes from
+         * RedisModule_GetClusterNodeInfo (see BuildCluster / MR_RefreshClusterData),
+         * which returns the PLAINTEXT node port whenever tls-cluster is off. So for OSS
+         * the inter-shard TLS decision must be gated strictly on tls-cluster: a bare
+         * tls-port (external TLS clients over an otherwise-plaintext bus) must NOT force
+         * TLS here, or we'd open a TLS handshake against a plaintext port -> the peer's
+         * RESP parser blocks on a reply that never comes and multi-shard commands
+         * (TS.MRANGE / TS.QUERYINDEX) hang until "execution max idle reached".
+         *
+         * The enterprise path keeps the historical tls-port fallback unchanged: there
+         * the DMC supplies the shard endpoints and this fallback has long been how
+         * inter-shard TLS is enabled while tls-cluster is not "yes". */
+        if (clusterCtx.isOss) {
+            ret = 0;
+            goto done;
+        }
         tlsPort = getConfigValue(mr_staticCtx, "tls-port");
         if (!tlsPort || !strcmp(tlsPort, "0")) {
             ret = 0;
