@@ -1,10 +1,12 @@
 import threading
 import time
 
+from RLTest import Defaults
+
 from common import MRTestDecorator, TimeLimit, initialiseCluster
 
 
-@MRTestDecorator(skipOnSingleShard=True)
+@MRTestDecorator(skipTest=Defaults.num_shards == 1)
 def testExecutionIdsDoNotCollideAfterShardRestart(env, conn):
     initiator = env.getConnection(shardId=1)
 
