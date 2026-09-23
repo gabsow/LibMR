@@ -1101,10 +1101,9 @@ static void MR_ReceivedExecution(void* ctx) {
 
     /* add the execution to the execution dictionary */
     if (mr_dictAdd(mrCtx.executionsDict, e->id, e) != DICT_OK) {
-        RedisModule_Log(mr_staticCtx,
-                        "warning",
-                        "Rejecting duplicate execution id %s",
-                        e->idStr);
+        /* A retransmitted execution is idempotent: acknowledge it without
+         * replacing the execution that is already running. */
+        MR_ClusterCopyAndSendMsg(e->id, ACK_EXECUTION_FUNCTION_ID, e->id, ID_LEN);
         MR_FreeExecution(e);
         return;
     }
@@ -1636,12 +1635,13 @@ int MR_Init(RedisModuleCtx* ctx, size_t numThreads, char *password, bool topolog
         return REDISMODULE_ERR;
     }
 
-    /* The shard id is stable across a process restart. Starting the sequence at
-     * zero would therefore reuse ids while remote shards can still hold an
-     * execution created by the previous process. Keep the wire format intact
-     * and randomize the 64-bit sequence origin for each module load. */
-    RedisModule_GetRandomBytes((unsigned char *)&mrCtx.lastExecutionId,
-                               sizeof(mrCtx.lastExecutionId));
+    RedisModule_Assert(sizeof(mrCtx.lastExecutionId) == sizeof(uint64_t));
+    uint32_t executionEpoch = 0;
+    while (executionEpoch == 0) {
+        RedisModule_GetRandomBytes((unsigned char *)&executionEpoch,
+                                   sizeof(executionEpoch));
+    }
+    mrCtx.lastExecutionId = (size_t)executionEpoch << 32;
     mrCtx.executionsDict = mr_dictCreate(&dictTypeHeapIds, NULL);
     mrCtx.remoteDict = mr_dictCreate(&dictTypeHeapIds, NULL);
 

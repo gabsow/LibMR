@@ -8,17 +8,20 @@ from common import MRTestDecorator, TimeLimit, initialiseCluster
 
 @MRTestDecorator(skipTest=Defaults.num_shards == 1)
 def testExecutionIdsDoNotCollideAfterShardRestart(env, conn):
+    """A restarted initiator must not reuse an ID retained by another shard."""
     initiator = env.getConnection(shardId=1)
 
     conn.execute_command('set', 'restart-id-key', 'value')
 
-    def start_old_execution():
+    # The remote mapper sleeps for 30 seconds. Killing only the initiator leaves
+    # this execution in the surviving shard's dictionary.
+    def leave_execution_on_surviving_shard():
         try:
             initiator.execute_command('lmrtest.unevenwork')
         except Exception:
             pass
 
-    old_thread = threading.Thread(target=start_old_execution)
+    old_thread = threading.Thread(target=leave_execution_on_surviving_shard)
     old_thread.start()
     time.sleep(0.5)
 
@@ -28,6 +31,9 @@ def testExecutionIdsDoNotCollideAfterShardRestart(env, conn):
     env.envRunner.shards[0].startEnv()
     initialiseCluster(env)
 
+    # Before the fix, the restarted shard reset its counter and readallkeys
+    # reused the retained execution's ID. The surviving shard then ran the
+    # stale unevenwork pipeline instead of the new readallkeys pipeline.
     restarted = env.getConnection(shardId=1)
     deadline = time.time() + 10
     while time.time() < deadline:
