@@ -4,6 +4,7 @@ import gevent.queue
 import gevent.socket
 import time
 import socket
+import threading
 
 class Connection(object):
     def __init__(self, sock, bufsize=4096, underlying_sock=None):
@@ -210,14 +211,14 @@ class ShardMock():
         conn = Connection(sock)
         self.new_conns.put(conn)
 
-    def _cluster_set_args(self, mock_shard_slot_start=8193, mock_shard_id='2', password='password'):
+    def _cluster_set_args(self, mock_shard_slot_start=8193, mock_shard_id='2', password='password', first_arg='NO-USED'):
         # IPv6 endpoints must be bracketed in host:port strings
         endpoint_host = '[%s]' % self.host if ':' in self.host else self.host
         # Build arguments according to MR_SetClusterData parser:
         # argv[6] => myId, argv[7] => "RANGES", argv[8] => numOfRanges, then repeating:
         # "SHARD" <id> "SLOTRANGE" <min> <max> "ADDR" <password@host:port> ["MASTER"]
         return [
-            'NO-USED',  # [1]
+            first_arg,  # [1]
             'NO-USED',  # [2]
             'NO-USED',  # [3]
             'NO-USED',  # [4]
@@ -237,10 +238,10 @@ class ShardMock():
             'MASTER'
         ]
 
-    def _send_cluster_set(self):
+    def _send_cluster_set(self, **kwargs):
         # try to promote to internal connection
         promote_internal_client_if_supported(env=self.env)
-        self.env.cmd('MRTESTS.CLUSTERSET', *self._cluster_set_args())
+        self.env.cmd('MRTESTS.CLUSTERSET', *self._cluster_set_args(**kwargs))
         self.env.cmd('MRTESTS.FORCESHARDSCONNECTION')
 
     def __enter__(self):
@@ -298,6 +299,117 @@ def _is_ipv6_enabled():
 
 def _get_hosts():
     return ['localhost', '::0'] if _is_ipv6_enabled() else ['localhost']
+
+
+def _long_form_cluster_set_args(conn, repetitions):
+    """Repeat the installed ranges to make the real replacement window observable."""
+    info = conn.execute_command('MRTESTS.INFOCLUSTER')
+    my_id = info[1]
+    nodes = [dict(zip(node[::2], node[1::2])) for node in info[4]]
+    args = [
+        'HASHFUNC', 'CRC16',
+        'NUMSLOTS', '16384',
+        'MYID', my_id,
+        'RANGES', str(len(nodes) * repetitions),
+    ]
+    for _ in range(repetitions):
+        for node in nodes:
+            host = node['ip']
+            endpoint_host = '[%s]' % host if ':' in host else host
+            args.extend([
+                'SHARD', node['id'],
+                'SLOTRANGE', str(node['minHslot']), str(node['maxHslot']),
+                'ADDR', 'password@%s:%s' % (endpoint_host, node['port']),
+                'MASTER',
+            ])
+    return args
+
+
+@MRTestDecorator(skipOnSingleShard=True)
+def testInternalCommandDuringLongFormClusterSet(env, conn):
+    topology_conn = env.getConnection(shardId=1)
+    internal_command_conn = env.getConnection(shardId=1)
+    promote_internal_client_if_supported(conn=topology_conn)
+
+    # MR_ClusterFree() sets clusterSize to one before SetClusterDataLongForm()
+    # installs the replacement. Repeating valid ranges widens that real
+    # replacement window without adding a test-only production hook.
+    cluster_set_args = _long_form_cluster_set_args(topology_conn, 2048)
+    topology_error = []
+
+    def replace_topology():
+        try:
+            topology_conn.execute_command('MRTESTS.CLUSTERSET', *cluster_set_args)
+            topology_conn.execute_command('MRTESTS.FORCESHARDSCONNECTION')
+        except Exception as error:
+            topology_error.append(error)
+
+    topology_thread = threading.Thread(target=replace_topology)
+    topology_thread.start()
+    time.sleep(0.01)
+
+    result = internal_command_conn.execute_command('lmrtest.internalcommand')
+    topology_thread.join(timeout=10)
+
+    env.assertFalse(topology_thread.is_alive(), message='CLUSTERSET did not finish')
+    env.assertEqual(topology_error, [])
+    env.assertEqual(result, 'OK')
+
+    # Execution start is asynchronous. On the buggy code it is marked local
+    # during the replacement window and reaches the worker assertion.
+    time.sleep(0.5)
+    env.assertTrue(internal_command_conn.ping())
+
+    # Restore the native topology so later tests never see repeated ranges.
+    env.broadcast('MRTESTS.REFRESHCLUSTER')
+
+
+@MRTestDecorator(skipOnSingleShard=True)
+def testInternalCommandDuringClusterRefresh(env, conn):
+    refresh_conn = env.getConnection(shardId=1)
+    internal_command_conn = env.getConnection(shardId=1)
+    start = threading.Barrier(3)
+    errors = []
+
+    def refresh_topology():
+        try:
+            start.wait()
+            # Repetition makes the real free/rebuild window deterministic
+            # without introducing a test-only delay in production code.
+            for _ in range(50):
+                refresh_conn.execute_command('MRTESTS.REFRESHCLUSTER')
+        except Exception as error:
+            errors.append(error)
+
+    def run_internal_commands():
+        try:
+            start.wait()
+            for _ in range(500):
+                internal_command_conn.execute_command('lmrtest.internalcommand')
+        except Exception as error:
+            errors.append(error)
+
+    refresh_thread = threading.Thread(target=refresh_topology)
+    internal_command_thread = threading.Thread(target=run_internal_commands)
+    refresh_thread.start()
+    internal_command_thread.start()
+    start.wait()
+
+    refresh_thread.join(timeout=20)
+    internal_command_thread.join(timeout=20)
+
+    env.assertFalse(refresh_thread.is_alive(), message='REFRESHCLUSTER did not finish')
+    env.assertFalse(internal_command_thread.is_alive(), message='internal commands did not finish')
+    env.assertEqual(errors, [])
+
+    # Execution start is asynchronous. A command classified from the temporary
+    # one-shard refresh state reaches the worker assertion after its reply.
+    time.sleep(0.5)
+    env.assertTrue(internal_command_conn.ping())
+
+    # Verify that the final refreshed topology can still run distributed work.
+    env.expect('lmrtest.readerror').equal([0, env.shardsCount])
+
 
 @MRTestDecorator(skipOnCluster=True)
 def testMessageIdCorrectness(env, conn):
@@ -631,6 +743,8 @@ def testClusterSetAfterHelloResponseFailure(env, conn):
             # send RG.HELLO bad reply
             conn.send_error('err')  # hello response, sending runid
 
+            # Remove the failed peer using a complete single-master topology.
+            # This still exercises cancellation of its reconnect callbacks.
             # resend cluster set
             # try to promote to internal connection
             promote_internal_client_if_supported(env=env)
@@ -640,7 +754,7 @@ def testClusterSetAfterHelloResponseFailure(env, conn):
                         'MYID', '1',
                         'RANGES', '1',
                         'SHARD', '1',
-                        'SLOTRANGE', '0', '8192',
+                        'SLOTRANGE', '0', '16383',
                         'ADDR', 'password@%s:6379' % shardMock.host,
                         'MASTER',
                         )
@@ -660,6 +774,8 @@ def testClusterSetAfterDisconnect(env, conn):
 
             # try to promote to internal connection
             promote_internal_client_if_supported(env=env)
+            # Remove the failed peer using a complete single-master topology.
+            # This still exercises cancellation of its reconnect callbacks.
             # resend cluster set
             res = env.cmd('MRTESTS.CLUSTERSET',
                         'HASHFUNC', 'CRC16',
@@ -667,7 +783,7 @@ def testClusterSetAfterDisconnect(env, conn):
                         'MYID', '1',
                         'RANGES', '1',
                         'SHARD', '1',
-                        'SLOTRANGE', '0', '8192',
+                        'SLOTRANGE', '0', '16383',
                         'ADDR', 'password@%s:6379' % shardMock.host,
                         'MASTER',
                         )
@@ -808,3 +924,49 @@ def testClusterSetPasswordChangeRebuilds(env, conn):
             env.assertNotEqual(env.cmd('MRTESTS.INFOCLUSTER')[3], run_id)
             env.cmd('MRTESTS.FORCESHARDSCONNECTION')
             conn = shardMock.GetConnection(password='password2')
+
+
+@MRTestDecorator(skipOnCluster=True)
+def testIdenticalLongFormClusterSetIsNoOp(env, conn):
+    for host in _get_hosts():
+        with ShardMock(env, host) as shardMock:
+            shardMock.GetConnection()
+            run_id = env.cmd('MRTESTS.INFOCLUSTER')[3]
+
+            shardMock._send_cluster_set()
+            env.assertEqual(env.cmd('MRTESTS.INFOCLUSTER')[3], run_id)
+
+            # An opaque argument change falls through to semantic reconciliation;
+            # the master set, endpoints and credentials remain unchanged.
+            shardMock._send_cluster_set(first_arg=b'NO-USED\0changed')
+            env.assertEqual(env.cmd('MRTESTS.INFOCLUSTER')[3], run_id)
+
+            run_id = env.cmd('MRTESTS.INFOCLUSTER')[3]
+            shardMock._send_cluster_set(mock_shard_id='3')
+            env.assertNotEqual(env.cmd('MRTESTS.INFOCLUSTER')[3], run_id)
+            shardMock.GetConnection()
+
+
+@MRTestDecorator(skipOnCluster=True)
+def testUnixAddrOnlyTopologyPreservesConnectionsAndRanges(env, conn):
+    for host in _get_hosts():
+        with ShardMock(env, host) as shardMock:
+            shardMock.GetConnection()
+            run_id = env.cmd('MRTESTS.INFOCLUSTER')[3]
+            args = shardMock._cluster_set_args()
+            # Different proxies include their own local sockets in equivalent topology.
+            for which in (0, 1, 0):
+                update = list(args)
+                masters = [i for i, value in enumerate(update) if value == 'MASTER']
+                update[masters[which]:masters[which]] = ['UNIXADDR', '/tmp/unused-test.sock']
+                env.expect('MRTESTS.CLUSTERSET', *update).equal('OK')
+                env.assertEqual(env.cmd('MRTESTS.INFOCLUSTER')[3], run_id)
+                env.cmd('MRTESTS.FORCESHARDSCONNECTION')
+                time.sleep(0.05)
+                env.assertTrue(shardMock.new_conns.empty())
+            env.expect('MRTESTS.CLUSTERSET', *shardMock._cluster_set_args(mock_shard_slot_start=4096)).equal('OK')
+            nodes = env.cmd('MRTESTS.INFOCLUSTER')[4]
+            ranges = sorted((dict(zip(n[::2], n[1::2]))['minHslot'],
+                             dict(zip(n[::2], n[1::2]))['maxHslot']) for n in nodes)
+            env.assertEqual(ranges, [(0, 4095), (4096, 16383)])
+            env.assertEqual(env.cmd('MRTESTS.INFOCLUSTER')[3], run_id)

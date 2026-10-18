@@ -49,7 +49,8 @@ jobs:
         git clone https://github.com/redis/redis
         cd redis
         git checkout ${{ matrix.redis_version }}
-        BUILD_TLS=yes make valgrind install
+        BUILD_TLS=yes make valgrind
+        sudo make install BUILD_TLS=yes SKIP_BUILD=1
     - name: install valgrind
       run: |
         sudo apt-get update --fix-missing
@@ -60,6 +61,7 @@ jobs:
       run: make run_tests
       env:
         PYTHON: python
+        RLTEST_EXTRA_ARGS: ${{ matrix.redis_version == 'unstable' && format('--redis-config-file {0}/tests/mr_test_module/redis-unstable.conf', github.workspace) || '' }}
     - name: SSL tests
       timeout-minutes: 25
       run: make run_tests_ssl
@@ -71,6 +73,7 @@ jobs:
       run: make run_tests_valgrind
       env:
         PYTHON: python
+        RLTEST_EXTRA_ARGS: ${{ matrix.redis_version == 'unstable' && format('--redis-config-file {0}/tests/mr_test_module/redis-unstable.conf', github.workspace) || '' }}
     - name: Upload test logs on failure
       if: failure()
       uses: actions/upload-artifact@v4
