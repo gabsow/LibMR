@@ -301,28 +301,27 @@ def _get_hosts():
     return ['localhost', '::0'] if _is_ipv6_enabled() else ['localhost']
 
 
-def _long_form_cluster_set_args(conn, repetitions):
-    """Repeat the installed ranges to make the real replacement window observable."""
+def _long_form_cluster_set_args(conn):
+    """Split installed ranges into single slots to widen the replacement window."""
     info = conn.execute_command('MRTESTS.INFOCLUSTER')
-    my_id = info[1]
-    nodes = [dict(zip(node[::2], node[1::2])) for node in info[4]]
-    args = [
-        'HASHFUNC', 'CRC16',
-        'NUMSLOTS', '16384',
-        'MYID', my_id,
-        'RANGES', str(len(nodes) * repetitions),
-    ]
-    for _ in range(repetitions):
-        for node in nodes:
-            host = node['ip']
-            endpoint_host = '[%s]' % host if ':' in host else host
-            args.extend([
-                'SHARD', node['id'],
-                'SLOTRANGE', str(node['minHslot']), str(node['maxHslot']),
-                'ADDR', 'password@%s:%s' % (endpoint_host, node['port']),
-                'MASTER',
-            ])
-    return args
+    entries = []
+    for raw_node in info[4]:
+        node = dict(zip(raw_node[::2], raw_node[1::2]))
+        host = node['ip']
+        endpoint_host = '[%s]' % host if ':' in host else host
+        for index in range(0, len(raw_node), 2):
+            if raw_node[index] != 'minHslot':
+                continue
+            assert raw_node[index + 2] == 'maxHslot'
+            for slot in range(raw_node[index + 1], raw_node[index + 3] + 1):
+                entries.extend([
+                    'SHARD', node['id'], 'SLOTRANGE', str(slot), str(slot),
+                    'ADDR', 'password@%s:%s' % (endpoint_host, node['port']), 'MASTER',
+                ])
+    return [
+        'HASHFUNC', 'CRC16', 'NUMSLOTS', '16384', 'MYID', info[1],
+        'RANGES', str(len(entries) // 8),
+    ] + entries
 
 
 @MRTestDecorator(skipOnSingleShard=True)
@@ -332,9 +331,9 @@ def testInternalCommandDuringLongFormClusterSet(env, conn):
     promote_internal_client_if_supported(conn=topology_conn)
 
     # MR_ClusterFree() sets clusterSize to one before SetClusterDataLongForm()
-    # installs the replacement. Repeating valid ranges widens that real
+    # installs the replacement. Splitting into single-slot ranges widens that real
     # replacement window without adding a test-only production hook.
-    cluster_set_args = _long_form_cluster_set_args(topology_conn, 2048)
+    cluster_set_args = _long_form_cluster_set_args(topology_conn)
     topology_error = []
 
     def replace_topology():
@@ -360,7 +359,7 @@ def testInternalCommandDuringLongFormClusterSet(env, conn):
     time.sleep(0.5)
     env.assertTrue(internal_command_conn.ping())
 
-    # Restore the native topology so later tests never see repeated ranges.
+    # Restore the native topology after the single-slot range expansion.
     env.broadcast('MRTESTS.REFRESHCLUSTER')
 
 
