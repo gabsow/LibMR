@@ -116,6 +116,8 @@ LIBMR_API void MR_RunOnAllShards(const char* remoteTaskName,
 
 /* Create either an empty execution builder or one that already includes the initial reader */
 LIBMR_API ExecutionBuilder* MR_CreateEmptyExecutionBuilder();
+/* INTERNAL executions only. Parsers must support concurrent independent executions. */
+LIBMR_API void MR_ExecutionBuilderSetReplyParsingOnWorkers(ExecutionBuilder* builder);
 LIBMR_API ExecutionBuilder* MR_CreateExecutionBuilder(const char* readerName, void* args);
 
 /* Add an internal command step (usually to an empty builder or a builder with internal commands only) */
@@ -207,6 +209,8 @@ LIBMR_API void MR_RegisterReader(const char* name, ExecutionReader reader, MRObj
 /* Register an internal command */
 typedef void (*InternalCommand)(struct RedisModuleCtx *ctx, void *args);  // Replies to caller client via the RedisModule_Reply...() family of functions
 typedef Record* (*InternalCommandReplyParser)(const redisReply *reply);  // Creates an object that's "derived from" Record that should be freed by the caller
+// Input is borrowed until the parser returns. By default parsers run on the event loop;
+// MR_ExecutionBuilderSetReplyParsingOnWorkers opts into concurrent worker execution.
 typedef struct InternalCommandCallbacks
 {
     InternalCommand command;
@@ -232,6 +236,8 @@ LIBMR_API void MR_RegisterRemoteTask(const char* name, RemoteTask remote, MRObje
 LIBMR_API void MR_SerializationCtxReaderRewind(ReaderSerializationCtx* sctx);
 LIBMR_API void MR_SerializationCtxWriterRewind(WriteSerializationCtx* sctx);
 LIBMR_API bool MR_SerializationCtxReaderIsDepleted(ReaderSerializationCtx* sctx);
+/* Consume an optional extension marker only if it matches; otherwise leave the reader unchanged. */
+LIBMR_API bool MR_SerializationCtxReadOptionalMarker(ReaderSerializationCtx* sctx, long long marker);
 LIBMR_API bool MR_SerializationCtxWriterIsDepleted(WriteSerializationCtx* sctx);
 
 /* Serialization Context functions */

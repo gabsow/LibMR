@@ -33,6 +33,8 @@ use mr::libmr_c_raw::bindings::{
     MR_CreateEmptyExecutionBuilder, MR_CreateExecution, MR_ExecutionBuilderInternalCommand,
     MR_ExecutionSetMaxIdle, MR_ExecutionSetOnDoneHandler, MR_FreeExecution,
     MR_FreeExecutionBuilder, MR_RegisterInternalCommand, MR_RegisterRecord, MR_Run,
+    MR_ExecutionBuilderSetReplyParsingOnWorkers, MR_ExecutionCtxGetResult,
+    MR_ExecutionCtxGetResultsLen, MR_ExecutionCtxGetErrorsLen, MR_ErrorFree,
 };
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +74,7 @@ fn ctx_unlock() {
 #[repr(C)]
 struct InternalCommandRecord {
     base: RawRecord,
+    parser_thread: thread::ThreadId,
 }
 
 unsafe extern "C" fn internal_command_record_free(record: *mut c_void) {
@@ -89,6 +92,7 @@ unsafe extern "C" fn internal_command_reply_parser(
         base: RawRecord {
             recordType: INTERNAL_COMMAND_RECORD_TYPE,
         },
+        parser_thread: thread::current().id(),
     });
     Box::into_raw(record) as *mut RawRecord
 }
@@ -121,6 +125,65 @@ fn lmr_internal_command(_ctx: &Context, _args: Vec<RedisString>) -> RedisResult 
         MR_FreeExecution(execution);
     }
     Ok(RedisValue::SimpleStringStatic("OK"))
+}
+
+unsafe extern "C" fn internal_reply_done<F: FnOnce(*mut ExecutionCtx)>(
+    ectx: *mut ExecutionCtx,
+    pd: *mut c_void,
+) {
+    Box::from_raw(pd as *mut F)(ectx);
+}
+
+fn set_internal_reply_done<F: FnOnce(*mut ExecutionCtx)>(
+    execution: *mut mr::libmr_c_raw::bindings::Execution,
+    callback: F,
+) {
+    unsafe {
+        MR_ExecutionSetOnDoneHandler(execution, Some(internal_reply_done::<F>),
+            Box::into_raw(Box::new(callback)).cast());
+    }
+}
+
+fn lmr_internal_reply(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
+    if args.len() > 2 || (args.len() == 2 && args[1].to_string() != "WORKERS") {
+        return Err(RedisError::Str("expected optional WORKERS argument"));
+    }
+    unsafe {
+        let builder = MR_CreateEmptyExecutionBuilder();
+        if args.len() == 2 {
+            MR_ExecutionBuilderSetReplyParsingOnWorkers(builder);
+        }
+        // Exercise multiple internal steps, each returning one record per shard.
+        for _ in 0..2 {
+            MR_ExecutionBuilderInternalCommand(builder,
+                b"LMRTEST.INTERNAL\0".as_ptr().cast(), ptr::null_mut());
+        }
+        let mut error = ptr::null_mut();
+        let execution = MR_CreateExecution(builder, &mut error);
+        MR_FreeExecutionBuilder(builder);
+        if !error.is_null() {
+            MR_ErrorFree(error);
+            MR_FreeExecution(execution);
+            return Err(RedisError::Str("failed creating reply execution"));
+        }
+        let blocked = ctx.block_client();
+        set_internal_reply_done(execution, move |ectx| {
+            let count = MR_ExecutionCtxGetResultsLen(ectx);
+            let mut same_thread = 0;
+            for i in 0..count {
+                let record = &*(MR_ExecutionCtxGetResult(ectx, i) as *const InternalCommandRecord);
+                same_thread += i64::from(record.parser_thread == thread::current().id());
+            }
+            ThreadSafeContext::with_blocked_client(blocked).reply(Ok(RedisValue::Array(vec![
+                RedisValue::Integer(count as i64),
+                RedisValue::Integer(MR_ExecutionCtxGetErrorsLen(ectx) as i64),
+                RedisValue::Integer(same_thread),
+            ])));
+        });
+        MR_Run(execution);
+        MR_FreeExecution(execution);
+    }
+    Ok(RedisValue::NoReply)
 }
 
 fn strin_record_new(s: String) -> StringRecord {
@@ -977,5 +1040,6 @@ redis_module! {
         ["lmrtest.readerror", lmr_read_error, "readonly", 0,0,0, AclCategory::None],
         ["lmrtest.unevenwork", lmr_uneven_work, "readonly", 0,0,0, AclCategory::None],
         ["lmrtest.internalcommand", lmr_internal_command, "readonly", 0,0,0, AclCategory::None],
+        ["lmrtest.internalreply", lmr_internal_reply, "readonly", 0,0,0, AclCategory::None],
     ],
 }
