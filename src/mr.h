@@ -57,8 +57,10 @@ typedef struct MRObjectType{
 
 typedef size_t functionId;
 
-// or-ed with a functionId to indicate internal commands (that should run on the recipient server's main message loop)
+// Dispatch internal commands on main; opted-in prepared work may continue on workers.
 #define FUNCTION_ID_INTERNAL    ((functionId)1 << (sizeof(functionId) * 8 - 1))
+/* Old receivers ignore this bit. Only opted-in callers receive the worker hint. */
+#define FUNCTION_ID_WORKER_HINT ((functionId)1 << (sizeof(functionId) * 8 - 2))
 
 LIBMR_API int MR_ClusterIsInClusterMode();
 
@@ -168,6 +170,7 @@ typedef struct redisReply redisReply;
 /* Set internal commands results in *all* Execution's steps' internalCommand; Run in event-loop */
 /* Return the total number of nodes that completed the execution (and responded with RESP results) */
 LIBMR_API void MR_SetInternalCommandResults(unsigned short nodeIndex, redisReply* reply, Execution *e);
+bool MR_UnwrapInternalWorkerHint(redisReply *reply, const Execution *e);
 
 /* Set max idle time (in ms) for the given execution */
 LIBMR_API void MR_ExecutionSetMaxIdle(Execution* e, size_t maxIdle);
@@ -225,7 +228,8 @@ LIBMR_API void MR_RegisterInternalCommand(const char* name, InternalCommandCallb
  * run and free must be safe on either thread and must not access live Redis data.
  * batchPrepare/batchFree optionally share metadata within one uninterrupted main
  * callback only. Prepared objects must own copies of any shared batch data.
- * The registration and wire format of synchronous commands remain unchanged. */
+ * Callback storage must outlive the registration. The command payload and
+ * synchronous reply format remain unchanged. */
 typedef struct InternalCommandPreparation {
     bool (*canPrepare)(struct RedisModuleCtx *ctx, void *args); /* Main-thread eligibility/cost check. */
     void *(*batchPrepare)(struct RedisModuleCtx *ctx);

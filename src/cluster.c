@@ -142,6 +142,8 @@ typedef struct Node{
     MR_LoopTaskCtx* resendHelloEvent;
     bool sendClusterTopologyOnNextConnect;
     ARR(struct Node *) queryConnections;
+    struct Node *queryOwner;
+    bool workerCommands;
 }Node;
 
 typedef struct Cluster {
@@ -275,6 +277,11 @@ static void MR_ClusterSendMsgToNodeInternal(Node* node, NodeSendMsg* nodeMsg){
  * its own ordered pending list and reconnect state; legacy reliable messages
  * continue to use the primary lane and its message-id sequence. */
 static Node *MR_SelectInternalCommandConnection(Node *node) {
+    /* Main-thread commands can pipeline efficiently on one connection. Only
+     * expand after a shard reports blocking its connection for worker execution.
+     * Idle extra connections remain available for the next expensive query. */
+    if (!node->workerCommands && node->status == NodeStatus_Connected)
+        return node;
     size_t limit = __atomic_load_n(&clusterCtx.internalCommandConnections, __ATOMIC_ACQUIRE);
     Node *best = node;
     size_t count = node->queryConnections ? array_len(node->queryConnections) : 0;
@@ -287,7 +294,7 @@ static Node *MR_SelectInternalCommandConnection(Node *node) {
              best->status != NodeStatus_Connected))
             best = candidate;
     }
-    if (mr_listLength(best->pendingMessages) && count + 1 < limit) {
+    if (node->workerCommands && mr_listLength(best->pendingMessages) && count + 1 < limit) {
         Node *lane = MR_CALLOC(1, sizeof(*lane));
         lane->id = MR_STRDUP(node->id);
         lane->ip = MR_STRDUP(node->ip);
@@ -296,6 +303,7 @@ static Node *MR_SelectInternalCommandConnection(Node *node) {
         lane->unixSocket = node->unixSocket ? MR_STRDUP(node->unixSocket) : NULL;
         lane->isMe = node->isMe;
         lane->index = node->index;
+        lane->queryOwner = node;
         lane->status = NodeStatus_Uninitialized;
         lane->pendingMessages = mr_listCreate();
         mr_listSetFreeMethod(lane->pendingMessages, MR_ClusterFreeNodeMsg);
@@ -431,6 +439,8 @@ static void MR_OnDataResponseArrived(struct redisAsyncContext* c, void* r, void*
     Execution *e = MR_GetExecution(message->msg->msg, message->msg->msgLen);
     mr_listDelNode(node->pendingMessages, pendingMessage);
 
+    Node *owner = node->queryOwner ? node->queryOwner : node;
+    owner->workerCommands = MR_UnwrapInternalWorkerHint(reply, e);
     MR_SetInternalCommandResults(node->index, reply, e);
 }
 
@@ -1849,7 +1859,7 @@ int MR_ForceShardsConnectionCommand(RedisModuleCtx *ctx, RedisModuleString **arg
     return REDISMODULE_OK;
 }
 
-int MR_ClusterExecuteInternalCommands(RedisModuleCtx *ctx, RedisModuleString *msg);
+int MR_ClusterExecuteInternalCommands(RedisModuleCtx *ctx, RedisModuleString *msg, bool workerHint);
 
 int MR_ClusterInnerCommunicationMsg(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
     if(argc != 6){
@@ -1858,7 +1868,7 @@ int MR_ClusterInnerCommunicationMsg(RedisModuleCtx *ctx, RedisModuleString **arg
     functionId fid = (functionId)strtoull(RedisModule_StringPtrLen(argv[3], NULL), NULL, 10);
     if (fid & FUNCTION_ID_INTERNAL) {
         RedisModuleString *msg = argv[4];
-        return MR_ClusterExecuteInternalCommands(ctx, msg);
+        return MR_ClusterExecuteInternalCommands(ctx, msg, (fid & FUNCTION_ID_WORKER_HINT) != 0);
     }
 
     /* We must copy argv because this command defers processing to the LibMR

@@ -12,7 +12,7 @@ use mr::redis_module;
 use redis_module::redisraw::bindings::{
     RedisModuleCtx, RedisModuleKey, RedisModuleScanCursor, RedisModuleString,
     RedisModule_GetDetachedThreadSafeContext, RedisModule_Scan, RedisModule_ScanCursorCreate,
-    RedisModule_ScanCursorDestroy, RedisModule_ReplyWithLongLong, RedisModule_ThreadSafeContextLock,
+    RedisModule_ScanCursorDestroy, RedisModule_ReplyWithLongLong, RedisModule_ReplyWithSimpleString, RedisModule_ThreadSafeContextLock,
     RedisModule_ThreadSafeContextUnlock,
 };
 
@@ -86,6 +86,10 @@ unsafe extern "C" fn internal_command_record_free(record: *mut c_void) {
 
 unsafe extern "C" fn internal_command(ctx: *mut MRRedisModuleCtx, _args: *mut c_void) {
     RedisModule_ReplyWithLongLong.unwrap()(ctx.cast(), 1);
+}
+
+unsafe extern "C" fn internal_hint_string(ctx: *mut MRRedisModuleCtx, _args: *mut c_void) {
+    RedisModule_ReplyWithSimpleString.unwrap()(ctx.cast(), b"__libmr_worker_reply_v1\0".as_ptr().cast());
 }
 
 unsafe extern "C" fn internal_command_reply_parser(
@@ -179,8 +183,8 @@ fn set_internal_reply_done<F: FnOnce(*mut ExecutionCtx)>(
 }
 
 fn lmr_internal_reply(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
-    if args.len() > 2 || (args.len() == 2 && !["WORKERS", "PREPARED"].contains(&args[1].to_string().as_str())) {
-        return Err(RedisError::Str("expected optional WORKERS or PREPARED argument"));
+    if args.len() > 2 || (args.len() == 2 && !["WORKERS", "PREPARED", "HINTSTRING"].contains(&args[1].to_string().as_str())) {
+        return Err(RedisError::Str("expected optional WORKERS, PREPARED or HINTSTRING argument"));
     }
     unsafe {
         let builder = MR_CreateEmptyExecutionBuilder();
@@ -191,6 +195,8 @@ fn lmr_internal_reply(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
         for _ in 0..2 {
             let name = if args.len() == 2 && args[1].to_string() == "PREPARED" {
                 b"LMRTEST.PREPARED\0".as_ptr()
+            } else if args.len() == 2 && args[1].to_string() == "HINTSTRING" {
+                b"LMRTEST.HINTSTRING\0".as_ptr()
             } else { b"LMRTEST.INTERNAL\0".as_ptr() };
             MR_ExecutionBuilderInternalCommand(builder, name.cast(), ptr::null_mut());
         }
@@ -1052,6 +1058,11 @@ fn init_func(ctx: &Context, args: &[RedisString]) -> Status {
             ptr::null_mut(),
         );
         MR_RegisterInternalCommand(b"LMRTEST.PREPARED\0".as_ptr().cast(), callbacks, ptr::null_mut());
+        MR_RegisterInternalCommand(b"LMRTEST.HINTSTRING\0".as_ptr().cast(),
+            Box::into_raw(Box::new(InternalCommandCallbacks {
+                command: Some(internal_hint_string),
+                replyParser: Some(internal_command_reply_parser),
+            })), ptr::null_mut());
         MR_RegisterInternalCommandPreparation(b"LMRTEST.PREPARED\0".as_ptr().cast(),
             Box::into_raw(Box::new(InternalCommandPreparation {
                 canPrepare: None,

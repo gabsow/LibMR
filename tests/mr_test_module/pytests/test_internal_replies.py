@@ -18,6 +18,8 @@ def testInternalReplyWorkerOptIn(env, conn):
                 # Preparation/batch lifecycle assert main-thread ownership in C/Rust;
                 # execution asserts that it has moved to a different thread.
                 assert connection.execute_command('lmrtest.internalreply', 'PREPARED') == [count, 0, count]
+                # Ordinary step data matching the hint marker is not metadata.
+                assert connection.execute_command('lmrtest.internalreply', 'HINTSTRING') == [count, 0, count]
         finally:
             connection.close()
 

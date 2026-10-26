@@ -1174,8 +1174,12 @@ typedef struct PreparedInternalExecution {
     RedisModuleBlockedClient *client;
     RedisModuleCtx *replyCtx;
     void **prepared;
+    bool workerHint;
+    bool onWorker;
     struct PreparedInternalExecution *next;
 } PreparedInternalExecution;
+
+#define INTERNAL_WORKER_HINT "__libmr_worker_reply_v1"
 
 static PreparedInternalExecution *preparedHead, *preparedTail;
 static size_t preparedRunning;
@@ -1198,7 +1202,9 @@ static void MR_FreePreparedReplyContext(RedisModuleCtx *ctx, void *data) {
 static void MR_RunPreparedInternalExecution(void *data) {
     PreparedInternalExecution *job = data;
     Execution *e = job->execution;
-    RedisModule_ReplyWithArray(job->replyCtx, array_len(e->steps));
+    bool hint = job->workerHint && job->onWorker;
+    RedisModule_ReplyWithArray(job->replyCtx, array_len(e->steps) + hint);
+    if (hint) RedisModule_ReplyWithSimpleString(job->replyCtx, INTERNAL_WORKER_HINT);
     for (size_t i = 0; i < array_len(e->steps); ++i) {
         Step *s = &e->steps[i];
         const InternalCommandPreparation *p = s->internalCommand.preparation;
@@ -1253,6 +1259,7 @@ static void MR_FreeInternalBatch(ARR(InternalBatchData) shared) {
 }
 
 static void MR_QueuePreparedInternalWorker(PreparedInternalExecution *job) {
+    job->onWorker = true;
     __atomic_add_fetch(&preparedRunning, 1, __ATOMIC_RELEASE);
     mr_thpool_add_work(mrCtx.executionsThreadPool, MR_RunPreparedInternalWorker, job);
 }
@@ -1280,7 +1287,7 @@ static void MR_DrainPreparedInternalExecutions(void *unused) {
 }
 
 /* Runs on redis-server's main loop */
-int MR_ClusterExecuteInternalCommands(RedisModuleCtx *ctx, RedisModuleString *msg) {
+int MR_ClusterExecuteInternalCommands(RedisModuleCtx *ctx, RedisModuleString *msg, bool workerHint) {
     size_t dataSize;
     const char* data = RedisModule_StringPtrLen(msg, &dataSize);
     mr_Buffer buff = {
@@ -1304,6 +1311,7 @@ int MR_ClusterExecuteInternalCommands(RedisModuleCtx *ctx, RedisModuleString *ms
         if (!preparedHead && __atomic_load_n(&preparedRunning, __ATOMIC_ACQUIRE) < preparedLimit) {
             PreparedInternalExecution *job = MR_CALLOC(1, sizeof(*job));
             job->execution = e;
+            job->workerHint = workerHint;
             job->replyCtx = ctx;
             ARR(InternalBatchData) shared = array_new(InternalBatchData, 2);
             bool worker = MR_PrepareInternalExecution(job, &shared);
@@ -1323,6 +1331,7 @@ int MR_ClusterExecuteInternalCommands(RedisModuleCtx *ctx, RedisModuleString *ms
         if (client) {
             PreparedInternalExecution *job = MR_CALLOC(1, sizeof(*job));
             job->execution = e;
+            job->workerHint = workerHint;
             job->client = client;
             if (preparedTail) preparedTail->next = job;
             else preparedHead = job;
@@ -1339,6 +1348,23 @@ int MR_ClusterExecuteInternalCommands(RedisModuleCtx *ctx, RedisModuleString *ms
     }
     MR_FreeExecution(e);
     return REDISMODULE_OK;
+}
+
+/* A legacy reply has exactly one element per step. The extra element makes the
+ * hint unambiguous even when an application's first step returns this string.
+ * Hiredis retains the enclosing array; remove only the metadata we own here. */
+bool MR_UnwrapInternalWorkerHint(redisReply *reply, const Execution *e) {
+    if (!e || reply->elements != array_len(e->steps) + 1)
+        return false;
+    redisReply *hint = reply->element[0];
+    RedisModule_Assert((hint->type == REDIS_REPLY_STATUS || hint->type == REDIS_REPLY_STRING) &&
+                       hint->len == strlen(INTERNAL_WORKER_HINT) &&
+                       memcmp(hint->str, INTERNAL_WORKER_HINT, hint->len) == 0);
+    freeReplyObject(hint);
+    --reply->elements;
+    memmove(reply->element, reply->element + 1, reply->elements * sizeof(*reply->element));
+    reply->element[reply->elements] = NULL;
+    return true;
 }
 
 static void MR_ParseInternalReply(Execution* e, const redisReply* reply) {
@@ -1480,7 +1506,7 @@ static bool MR_ExecutionDistribute(Execution* e, void* pd) {
     functionId fid = NEW_EXECUTION_RECEIVED_FUNCTION_ID;
     if (MR_IsInternalCommandsExecution(e)) {
         // We signal it to the INNER_COMMUNICATION handler function using this tiny hack:
-        fid |= FUNCTION_ID_INTERNAL;
+        fid |= FUNCTION_ID_INTERNAL | FUNCTION_ID_WORKER_HINT;
     }
     MR_ClusterSendMsg(NULL, fid, buff.buff, buff.size);
 
