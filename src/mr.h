@@ -219,6 +219,24 @@ typedef struct InternalCommandCallbacks
 /* Note: pass static InternalCommandCallback structs since the pointer is opaque to some of the functions and we don't really need to delete it */
 LIBMR_API void MR_RegisterInternalCommand(const char* name, InternalCommandCallbacks*, MRObjectType* argType);
 
+/* Optional two-phase execution for an already registered internal command.
+ * prepare runs on main and must detach all data needed by run from the keyspace.
+ * Its return value requests a worker; false permits cheap prepared work on main.
+ * run and free must be safe on either thread and must not access live Redis data.
+ * batchPrepare/batchFree optionally share metadata within one uninterrupted main
+ * callback only. Prepared objects must own copies of any shared batch data.
+ * The registration and wire format of synchronous commands remain unchanged. */
+typedef struct InternalCommandPreparation {
+    bool (*canPrepare)(struct RedisModuleCtx *ctx, void *args); /* Main-thread eligibility/cost check. */
+    void *(*batchPrepare)(struct RedisModuleCtx *ctx);
+    void (*batchFree)(struct RedisModuleCtx *ctx, void *batch);
+    bool (*prepare)(struct RedisModuleCtx *ctx, void *args, void *batch, void **prepared);
+    void (*run)(struct RedisModuleCtx *ctx, void *args, void *prepared);
+    void (*free)(void *prepared);
+} InternalCommandPreparation;
+LIBMR_API void MR_RegisterInternalCommandPreparation(const char *name,
+                                                     const InternalCommandPreparation *callbacks);
+
 
 /* Register a map step */
 LIBMR_API void MR_RegisterMapper(const char* name, ExecutionMapper mapper, MRObjectType* argType);

@@ -188,6 +188,7 @@ typedef struct StepDefinition {
     char* name;
     MRObjectType* type;
     void* callback;
+    const InternalCommandPreparation *preparation;
 }StepDefinition;
 
 typedef struct ReadStep {
@@ -208,6 +209,7 @@ typedef struct InternalCommandStep {
     InternalCommandReplyParser replyParser;
     redisReply *reply;  // to be parsed by the replyParser
     size_t nDone;
+    const InternalCommandPreparation *preparation;
 }InternalCommandStep;
 
 typedef struct FilterStep {
@@ -499,6 +501,7 @@ static void MR_InitializeFromStepDef(Step*s, StepDefinition* sd) {
         s->internalCommand.replyParser = callbacks->replyParser;
         s->internalCommand.reply = NULL;
         s->internalCommand.nDone = 0;
+        s->internalCommand.preparation = sd->preparation;
         break;
     }
     default:
@@ -1166,6 +1169,116 @@ static Execution* MR_ExecutionDeserialize(mr_BufferReader* buffReader) {
     return e;
 }
 
+typedef struct PreparedInternalExecution {
+    Execution *execution;
+    RedisModuleBlockedClient *client;
+    RedisModuleCtx *replyCtx;
+    void **prepared;
+    struct PreparedInternalExecution *next;
+} PreparedInternalExecution;
+
+static PreparedInternalExecution *preparedHead, *preparedTail;
+static size_t preparedRunning;
+static size_t preparedLimit;
+static int preparedScheduled;
+static void MR_DrainPreparedInternalExecutions(void *unused);
+
+static void MR_SchedulePreparedInternalExecutions(void) {
+    if (!__atomic_exchange_n(&preparedScheduled, 1, __ATOMIC_ACQ_REL)) {
+        int rc = RedisModule_EventLoopAddOneShot(MR_DrainPreparedInternalExecutions, NULL);
+        RedisModule_Assert(rc == REDISMODULE_OK);
+    }
+}
+
+/* Some older Redis-on-Flash builds require context destruction on main. */
+static void MR_FreePreparedReplyContext(RedisModuleCtx *ctx, void *data) {
+    if (data) RedisModule_FreeThreadSafeContext(data);
+}
+
+static void MR_RunPreparedInternalExecution(void *data) {
+    PreparedInternalExecution *job = data;
+    Execution *e = job->execution;
+    RedisModule_ReplyWithArray(job->replyCtx, array_len(e->steps));
+    for (size_t i = 0; i < array_len(e->steps); ++i) {
+        Step *s = &e->steps[i];
+        const InternalCommandPreparation *p = s->internalCommand.preparation;
+        p->run(job->replyCtx, s->bStep.args, job->prepared[i]);
+        p->free(job->prepared[i]);
+    }
+    MR_FreeExecution(e);
+    MR_FREE(job->prepared);
+    if (job->client) RedisModule_UnblockClient(job->client, job->replyCtx);
+    MR_FREE(job);
+}
+
+static void MR_RunPreparedInternalWorker(void *data) {
+    MR_RunPreparedInternalExecution(data);
+    __atomic_sub_fetch(&preparedRunning, 1, __ATOMIC_RELEASE);
+    MR_SchedulePreparedInternalExecutions();
+}
+
+typedef struct InternalBatchData {
+    const InternalCommandPreparation *callbacks;
+    void *data;
+} InternalBatchData;
+
+static bool MR_PrepareInternalExecution(PreparedInternalExecution *job,
+                                       ARR(InternalBatchData) *shared) {
+    Execution *e = job->execution;
+    bool worker = false;
+    job->prepared = MR_CALLOC(array_len(e->steps), sizeof(*job->prepared));
+    for (size_t i = 0; i < array_len(e->steps); ++i) {
+        Step *s = &e->steps[i];
+        const InternalCommandPreparation *p = s->internalCommand.preparation;
+        void *batch = NULL;
+        if (p->batchPrepare) {
+            size_t j;
+            for (j = 0; j < array_len(*shared); ++j)
+                if ((*shared)[j].callbacks == p) break;
+            if (j == array_len(*shared)) {
+                InternalBatchData entry = {p, p->batchPrepare(mr_staticCtx)};
+                *shared = array_append(*shared, entry);
+            }
+            batch = (*shared)[j].data;
+        }
+        worker |= p->prepare(job->replyCtx, s->bStep.args, batch, &job->prepared[i]);
+    }
+    return worker;
+}
+
+static void MR_FreeInternalBatch(ARR(InternalBatchData) shared) {
+    for (size_t i = 0; i < array_len(shared); ++i)
+        shared[i].callbacks->batchFree(mr_staticCtx, shared[i].data);
+    array_free(shared);
+}
+
+static void MR_QueuePreparedInternalWorker(PreparedInternalExecution *job) {
+    __atomic_add_fetch(&preparedRunning, 1, __ATOMIC_RELEASE);
+    mr_thpool_add_work(mrCtx.executionsThreadPool, MR_RunPreparedInternalWorker, job);
+}
+
+static void MR_DrainPreparedInternalExecutions(void *unused) {
+    RedisModule_Assert(MR_IsMainThread());
+    __atomic_store_n(&preparedScheduled, 0, __ATOMIC_RELEASE);
+    ARR(InternalBatchData) shared = array_new(InternalBatchData, 2);
+    size_t count = 0;
+    /* Bound copied snapshots. Waiting requests retain only their arguments. */
+    while (preparedHead && count++ < 64 &&
+           __atomic_load_n(&preparedRunning, __ATOMIC_ACQUIRE) < preparedLimit) {
+        PreparedInternalExecution *job = preparedHead;
+        preparedHead = job->next;
+        if (!preparedHead) preparedTail = NULL;
+        job->replyCtx = RedisModule_GetThreadSafeContext(job->client);
+        if (MR_PrepareInternalExecution(job, &shared))
+            MR_QueuePreparedInternalWorker(job);
+        else
+            MR_RunPreparedInternalExecution(job);
+    }
+    MR_FreeInternalBatch(shared);
+    if (preparedHead && __atomic_load_n(&preparedRunning, __ATOMIC_ACQUIRE) < preparedLimit)
+        MR_SchedulePreparedInternalExecutions();
+}
+
 /* Runs on redis-server's main loop */
 int MR_ClusterExecuteInternalCommands(RedisModuleCtx *ctx, RedisModuleString *msg) {
     size_t dataSize;
@@ -1178,6 +1291,46 @@ int MR_ClusterExecuteInternalCommands(RedisModuleCtx *ctx, RedisModuleString *ms
     mr_BufferReader buffReader;
     mr_BufferReaderInit(&buffReader, &buff);
     Execution* e = MR_ExecutionDeserialize(&buffReader);
+    bool canPrepare = RedisModule_EventLoopAddOneShot &&
+                      !(RedisModule_GetContextFlags(ctx) & REDISMODULE_CTX_FLAGS_DENY_BLOCKING);
+    for (size_t i = 0; i < array_len(e->steps); ++i) {
+        const InternalCommandPreparation *p = e->steps[i].internalCommand.preparation;
+        canPrepare &= p && (!p->canPrepare || p->canPrepare(ctx, e->steps[i].bStep.args));
+    }
+    if (canPrepare) {
+        /* Cheap requests complete directly: blocking and waking a client costs
+         * more than a short range scan. Only defer preparation when snapshots
+         * already occupy the bounded worker queue. */
+        if (!preparedHead && __atomic_load_n(&preparedRunning, __ATOMIC_ACQUIRE) < preparedLimit) {
+            PreparedInternalExecution *job = MR_CALLOC(1, sizeof(*job));
+            job->execution = e;
+            job->replyCtx = ctx;
+            ARR(InternalBatchData) shared = array_new(InternalBatchData, 2);
+            bool worker = MR_PrepareInternalExecution(job, &shared);
+            MR_FreeInternalBatch(shared);
+            if (worker)
+                job->client = RedisModule_BlockClient(ctx, NULL, NULL, MR_FreePreparedReplyContext, 0);
+            if (job->client) {
+                job->replyCtx = RedisModule_GetThreadSafeContext(job->client);
+                MR_QueuePreparedInternalWorker(job);
+            } else {
+                MR_RunPreparedInternalExecution(job);
+            }
+            return REDISMODULE_OK;
+        }
+        RedisModuleBlockedClient *client =
+            RedisModule_BlockClient(ctx, NULL, NULL, MR_FreePreparedReplyContext, 0);
+        if (client) {
+            PreparedInternalExecution *job = MR_CALLOC(1, sizeof(*job));
+            job->execution = e;
+            job->client = client;
+            if (preparedTail) preparedTail->next = job;
+            else preparedHead = job;
+            preparedTail = job;
+            MR_SchedulePreparedInternalExecutions();
+            return REDISMODULE_OK;
+        }
+    }
     RedisModule_ReplyWithArray(ctx, array_len(e->steps));
     for (int i = 0; i < array_len(e->steps); i++) {
         Step *s = e->steps + i;
@@ -1665,6 +1818,7 @@ int MR_Init(RedisModuleCtx* ctx, size_t numThreads, char *password, bool topolog
     if (MR_ClusterInit(ctx, password, topologyEvents) != REDISMODULE_OK) {
         return REDISMODULE_ERR;
     }
+    MR_ClusterSetInternalCommandConnections(numThreads + 1);
 
     // We want the execution id to be unique, even after a shard crashes and comes back to life, so we set its
     // high 32 bits to the current time (if a shard crashes multiple times a second we have a bigger problem...)
@@ -1683,6 +1837,7 @@ int MR_Init(RedisModuleCtx* ctx, size_t numThreads, char *password, bool topolog
     mrCtx.internalCommandsDict = mr_dictCreate(&mr_dictTypeHeapStrings, NULL);
 
     mrCtx.executionsThreadPool = mr_thpool_init(numThreads);
+    preparedLimit = numThreads > 0 ? numThreads * 2 : 2;
     mrCtx.stats = (MRStats){
             .nMissedExecutions = 0,
             .nMaxIdleReached = 0,
@@ -1715,6 +1870,8 @@ int MR_ResizeExecutionThreadPoolIfUnstarted(size_t numThreads) {
     if (mr_thpool_resize_unstarted(tp, numThreads) != 0) {
         return REDISMODULE_ERR;
     }
+    preparedLimit = numThreads > 0 ? numThreads * 2 : 2;
+    MR_ClusterSetInternalCommandConnections(numThreads + 1);
     return REDISMODULE_OK;
 }
 
@@ -1755,6 +1912,14 @@ void MR_RegisterInternalCommand(const char* name, InternalCommandCallbacks *call
         .callback = callbacks
     };
     mr_dictAdd(mrCtx.internalCommandsDict, sd->name, sd);
+}
+
+void MR_RegisterInternalCommandPreparation(const char *name,
+                                          const InternalCommandPreparation *callbacks) {
+    StepDefinition *sd = mr_dictFetchValue(mrCtx.internalCommandsDict, name);
+    RedisModule_Assert(sd && callbacks && callbacks->prepare && callbacks->run && callbacks->free);
+    RedisModule_Assert(!callbacks->batchPrepare || callbacks->batchFree);
+    sd->preparation = callbacks;
 }
 
 void MR_RegisterMapper(const char* name, ExecutionMapper mapper, MRObjectType* argType) {

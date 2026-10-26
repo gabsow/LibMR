@@ -141,6 +141,7 @@ typedef struct Node{
     MR_LoopTaskCtx* reconnectEvent;
     MR_LoopTaskCtx* resendHelloEvent;
     bool sendClusterTopologyOnNextConnect;
+    ARR(struct Node *) queryConnections;
 }Node;
 
 typedef struct Cluster {
@@ -165,6 +166,7 @@ struct ClusterCtx {
     functionId networkTestMsgReceiver;
     char *password;
     bool topologyEvents;
+    size_t internalCommandConnections;
 }clusterCtx;
 
 bool MR_TopologyEventSeen = false;
@@ -206,6 +208,7 @@ static void MR_OnDataResponseArrived(struct redisAsyncContext* c, void* a, void*
 static void MR_ConnectToShard(Node* n);
 static void MR_HelloResponseArrived(struct redisAsyncContext* c, void* a, void* b);
 static Node* MR_GetNode(Cluster* cluster, const char* id);
+static void MR_NodeFree(Node* n);
 
 static bool clusterSetCommandReceived = false;
 static ClusterType cachedClusterType = ClusterType_NONE;
@@ -267,7 +270,47 @@ static void MR_ClusterSendMsgToNodeInternal(Node* node, NodeSendMsg* nodeMsg){
             nodeMsg->msgId);
 }
 
+/* Internal commands may block their connection while running on a shard worker.
+ * Open additional authenticated lanes only under concurrent load. Each lane has
+ * its own ordered pending list and reconnect state; legacy reliable messages
+ * continue to use the primary lane and its message-id sequence. */
+static Node *MR_SelectInternalCommandConnection(Node *node) {
+    size_t limit = __atomic_load_n(&clusterCtx.internalCommandConnections, __ATOMIC_ACQUIRE);
+    Node *best = node;
+    size_t count = node->queryConnections ? array_len(node->queryConnections) : 0;
+    for (size_t i = 0; i < count; ++i) {
+        Node *candidate = node->queryConnections[i];
+        size_t pending = mr_listLength(candidate->pendingMessages);
+        size_t bestPending = mr_listLength(best->pendingMessages);
+        if (pending < bestPending ||
+            (pending == bestPending && candidate->status == NodeStatus_Connected &&
+             best->status != NodeStatus_Connected))
+            best = candidate;
+    }
+    if (mr_listLength(best->pendingMessages) && count + 1 < limit) {
+        Node *lane = MR_CALLOC(1, sizeof(*lane));
+        lane->id = MR_STRDUP(node->id);
+        lane->ip = MR_STRDUP(node->ip);
+        lane->port = node->port;
+        lane->password = node->password ? MR_STRDUP(node->password) : NULL;
+        lane->unixSocket = node->unixSocket ? MR_STRDUP(node->unixSocket) : NULL;
+        lane->isMe = node->isMe;
+        lane->index = node->index;
+        lane->status = NodeStatus_Uninitialized;
+        lane->pendingMessages = mr_listCreate();
+        mr_listSetFreeMethod(lane->pendingMessages, MR_ClusterFreeNodeMsg);
+        lane->slotRanges = mr_listCreate();
+        if (!node->queryConnections)
+            node->queryConnections = array_new(Node *, limit - 1);
+        node->queryConnections = array_append(node->queryConnections, lane);
+        best = lane;
+    }
+    return best;
+}
+
 static void MR_ClusterSendMsgToNode(Node* node, SendMsg* msg){
+    if (msg->function & FUNCTION_ID_INTERNAL)
+        node = MR_SelectInternalCommandConnection(node);
     msg->refCount+=1;
     NodeSendMsg* nodeMsg = MR_ALLOC(sizeof(*nodeMsg));
     nodeMsg->msg = msg;
@@ -806,6 +849,11 @@ static void MR_NodeFreeInternals(Node* n){
 }
 
 static void MR_NodeFree(Node* n){
+    if (n->queryConnections) {
+        for (size_t i = 0; i < array_len(n->queryConnections); ++i)
+            MR_NodeFree(n->queryConnections[i]);
+        array_free(n->queryConnections);
+    }
     if(n->c){
         n->c->data = NULL;
     }
@@ -1883,6 +1931,7 @@ int MR_ClusterInit(RedisModuleCtx* rctx, char *password, bool topologyEvents) {
     clusterCtx.clusterSize = 1;
     clusterCtx.password = password ? MR_STRDUP(password) : NULL;
     clusterCtx.topologyEvents = topologyEvents;
+    clusterCtx.internalCommandConnections = 1;
     memset(clusterCtx.myId, '0', REDISMODULE_NODE_ID_LEN);
 
     SetCachedClusterType(rctx);
@@ -1954,6 +2003,11 @@ int MR_ClusterInit(RedisModuleCtx* rctx, char *password, bool topologyEvents) {
     clusterCtx.networkTestMsgReceiver = MR_ClusterRegisterMsgReceiver(MR_NetworkTest);
 
     return REDISMODULE_OK;
+}
+
+void MR_ClusterSetInternalCommandConnections(size_t count) {
+    RedisModule_Assert(MR_IsMainThread());
+    __atomic_store_n(&clusterCtx.internalCommandConnections, count ? count : 1, __ATOMIC_RELEASE);
 }
 
 int MR_IsClusterInitialize() {
